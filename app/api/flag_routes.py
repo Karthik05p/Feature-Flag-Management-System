@@ -1,0 +1,428 @@
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+from app.database.session import get_db
+from app.models.flag import Flag
+from app.services.evaluation_engine import evaluate_flag, invalidate_flag_cache_safely
+from app.schemas.evaluation import EvaluationRequest
+from app.schemas.feat_flag import FlagCreate, FlagUpdate
+from app.models.targeting_rule import TargetingRule
+from app.schemas.targeting_rule import TargetingRuleCreate, TargetingRuleUpdate
+from app.models.environment import Environment
+from app.schemas.environment import CreateEnvironment, UpdateEnvironment
+from app.core.security import AuthenticatedUser, get_current_user
+from app.services.audit_service import create_audit_log, flag_to_dict, targeting_rule_to_dict
+
+router = APIRouter(dependencies=[Depends(get_current_user)])
+
+# Flags
+
+@router.get("/flags")
+def get_all_flags(db: Session = Depends(get_db)):
+    return db.query(Flag).all()
+
+
+@router.get("/flags/{flag_id}")
+def get_flag(flag_id: int, db: Session = Depends(get_db)):
+    return(
+        db.query(Flag)
+        .filter(Flag.id == flag_id)
+        .first()
+    )
+   
+    
+@router.post("/evaluate")
+def evaluate(
+    request: EvaluationRequest,
+    db: Session = Depends(get_db)
+):
+    return evaluate_flag(
+        db=db,
+        flag_key=request.flag_key,
+        environment_name=request.environment_name,
+        user_context=request.user_context
+    )
+    
+
+@router.post("/flags")
+def create_flag(
+    request: FlagCreate,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    flag = Flag(
+        environment_id=request.environment_id,
+        key=request.key,
+        name=request.name,
+        type=request.type,
+        default_value=request.default_value,
+        enabled=request.enabled,
+        description=request.description,
+        owner_team=request.owner_team        
+    )
+    duplicate = (
+        db.query(Flag)
+        .filter(Flag.environment_id == request.environment_id, Flag.key == request.key)
+        .first()
+    )
+    if duplicate is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A feature flag with this key already exists in this environment.",
+        )
+
+    db.add(flag)
+    try:
+        db.flush()
+    except IntegrityError as error:
+        db.rollback()
+        database_error = str(getattr(error, "orig", error))
+        is_duplicate_key = (
+            "uq_environment_flag_key" in database_error
+            or ("flags.environment_id" in database_error and "flags.key" in database_error)
+        )
+        if is_duplicate_key:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A feature flag with this key already exists in this environment.",
+            ) from error
+        raise
+
+    create_audit_log(db, flag_id=flag.id, environment_id=flag.environment_id, actor=current_user.username, action="CREATE", new_state=flag_to_dict(flag))
+    db.commit()
+    db.refresh(flag)
+    invalidate_flag_cache_safely(flag.environment.name, flag.key)
+    
+    return flag
+
+
+@router.put("/flags/{flag_id}")
+def update_flag(
+    flag_id: int,
+    request: FlagUpdate,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    flag = (db.query(Flag)
+            .filter(Flag.id == flag_id)
+            .first()
+            )  
+
+    if flag is None:
+        return {
+            "message": "Feature flag not found"
+        }
+        
+    previous_environment_name = flag.environment.name
+    previous_key = flag.key
+    old_state = flag_to_dict(flag)
+
+    flag.key = request.key
+    flag.type = request.type
+    flag.default_value = request.default_value
+    flag.enabled = request.enabled
+    flag.description = request.description
+    flag.owner_team = request.owner_team
+    db.flush()
+    new_state = flag_to_dict(flag)
+    action = "UPDATE" if old_state["enabled"] == new_state["enabled"] else ("ENABLE" if new_state["enabled"] else "DISABLE")
+    create_audit_log(db, flag_id=flag.id, environment_id=flag.environment_id, actor=current_user.username, action=action, old_state=old_state, new_state=new_state)
+    db.commit()
+    db.refresh(flag)
+    invalidate_flag_cache_safely(previous_environment_name, previous_key)
+    if (previous_environment_name, previous_key) != (flag.environment.name, flag.key):
+        invalidate_flag_cache_safely(flag.environment.name, flag.key)
+    
+    return flag
+    
+    
+@router.delete("/flags/{flag_id}")
+def delete_flag(
+    flag_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    flag = (
+        db.query(Flag)
+        .filter(Flag.id == flag_id)
+        .first()
+    )
+    
+    if flag is None:
+        return {
+            "message": "Feature flag not found"
+        }
+        
+    environment_name = flag.environment.name
+    flag_key = flag.key
+    create_audit_log(db, flag_id=flag.id, environment_id=flag.environment_id, actor=current_user.username, action="DELETE", old_state=flag_to_dict(flag))
+    db.delete(flag)
+    db.commit()
+    invalidate_flag_cache_safely(environment_name, flag_key)
+
+    return {
+        "message": "Feature flag deleted successfully",
+        "flag_id": flag_id
+    }
+    
+
+# Targeting Rules
+  
+@router.get("/targeting-rules")
+def get_all_targeting_rules(
+    db:Session = Depends(get_db)
+):
+    return db.query(TargetingRule).all()
+
+
+@router.get("/targeting-rules/{rule_id}")
+def get_targeting_rules_by_id(
+    rule_id:int, db:Session = Depends(get_db)
+):
+    rule = (db.query(TargetingRule)
+            .filter(TargetingRule.id == rule_id)
+            .first()
+            )
+    
+    if rule is None:
+        return{
+            "message": "Targeting rule not found"
+        }
+        
+    return rule
+    
+    
+@router.post("/targeting-rules")
+def create_targeting_rule(
+    request: TargetingRuleCreate,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    rule = TargetingRule(
+        flag_id=request.flag_id,
+        priority=request.priority,
+        rule_type=request.rule_type,
+        operator=request.operator,
+        value=request.value,
+        percentage=request.percentage,
+        enabled=request.enabled,
+        is_active=request.is_active,
+    )
+
+    flag = db.query(Flag).filter(Flag.id == rule.flag_id).first()
+    db.add(rule)
+    db.flush()
+    if flag is not None:
+        create_audit_log(db, flag_id=flag.id, environment_id=flag.environment_id, actor=current_user.username, action="TARGETING_RULE_CREATE", new_state=targeting_rule_to_dict(rule, flag.environment_id, flag))
+    db.commit()
+    db.refresh(rule)
+    flag = db.query(Flag).filter(Flag.id == rule.flag_id).first()
+    if flag is not None:
+        invalidate_flag_cache_safely(flag.environment.name, flag.key)
+
+    return rule
+
+
+@router.put("/targeting-rules/{rule_id}")
+def update_targeting_rule(
+    rule_id: int,
+    request: TargetingRuleUpdate,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    rule = (db.query(TargetingRule)
+            .filter(TargetingRule.id == rule_id)
+            .first()
+            )
+    
+    if rule is None:
+        return{
+            "message": "Targeting rule not found"
+        }
+        
+    previous_flag = db.query(Flag).filter(Flag.id == rule.flag_id).first()
+    previous_cache_namespace = (
+        (previous_flag.environment.name, previous_flag.key)
+        if previous_flag is not None
+        else None
+    )
+    old_state = targeting_rule_to_dict(rule, previous_flag.environment_id, previous_flag) if previous_flag is not None else None
+    current_flag = db.query(Flag).filter(Flag.id == request.flag_id).first()
+
+    rule.flag_id = request.flag_id
+    rule.priority = request.priority
+    rule.rule_type = request.rule_type
+    rule.operator = request.operator
+    rule.value = request.value
+    rule.percentage = request.percentage
+    rule.enabled = request.enabled
+    if request.is_active is not None:
+        rule.is_active = request.is_active
+    db.flush()
+    if current_flag is not None:
+        create_audit_log(db, flag_id=current_flag.id, environment_id=current_flag.environment_id, actor=current_user.username, action="TARGETING_RULE_UPDATE", old_state=old_state, new_state=targeting_rule_to_dict(rule, current_flag.environment_id, current_flag))
+    db.commit()
+    db.refresh(rule)
+    if previous_cache_namespace is not None:
+        invalidate_flag_cache_safely(*previous_cache_namespace)
+    if current_flag is not None:
+        current_cache_namespace = (current_flag.environment.name, current_flag.key)
+        if current_cache_namespace != previous_cache_namespace:
+            invalidate_flag_cache_safely(*current_cache_namespace)
+    
+    return rule
+
+
+@router.delete("/targeting-rules/{rule_id}")
+def delete_targeting_rule(
+    rule_id: int,
+    db: Session = Depends(get_db),
+    current_user: AuthenticatedUser = Depends(get_current_user),
+):
+    rule = (
+        db.query(TargetingRule)
+        .filter(TargetingRule.id == rule_id)
+        .first()
+    )
+    
+    if rule is None:
+        return{
+            "message": "Targeting rule not found"
+        }
+        
+    flag = db.query(Flag).filter(Flag.id == rule.flag_id).first()
+    cache_namespace = (
+        (flag.environment.name, flag.key)
+        if flag is not None
+        else None
+    )
+    if flag is not None:
+        create_audit_log(db, flag_id=flag.id, environment_id=flag.environment_id, actor=current_user.username, action="TARGETING_RULE_DELETE", old_state=targeting_rule_to_dict(rule, flag.environment_id, flag))
+    db.delete(rule)
+    db.commit()
+    if cache_namespace is not None:
+        invalidate_flag_cache_safely(*cache_namespace)
+    
+    return {
+        "message": "Targeting rule deleted successfully",
+        "rule_id": rule_id
+    }
+    
+    
+# Environments
+
+@router.get("/environment")
+def get_all_environments(
+    db: Session = Depends(get_db)
+):
+    return db.query(Environment).all()
+
+
+@router.get("/environment/{environment_id}")
+def get_environment_by_id(
+    environment_id: int,
+    db: Session = Depends(get_db)
+):
+    environment = (
+        db.query(Environment)
+        .filter(Environment.id == environment_id)
+        .first()
+    )
+    
+    if environment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Environment not found.")
+        
+    return environment
+
+
+@router.post("/environment")
+def create_environment(
+    request: CreateEnvironment,
+    db:Session = Depends(get_db)
+):
+    environment = Environment(
+        name=request.name,
+        description=request.description,
+        is_active=request.is_active
+    )
+    
+    db.add(environment)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An environment with this name already exists.") from None
+    db.refresh(environment)
+    
+    return environment
+
+
+@router.put("/environment/{environment_id}")
+def update_environment(
+    environment_id: int,
+    request: UpdateEnvironment,
+    db:Session = Depends(get_db)
+):
+    environment = (db.query(Environment)
+                   .filter(Environment.id == environment_id)
+                   .first()
+                   )
+    
+    if environment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Environment not found.")
+
+    if request.name != environment.name and db.query(Environment).filter(
+        Environment.name == request.name,
+        Environment.id != environment_id,
+    ).first() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An environment with this name already exists.")
+
+    old_environment_name = environment.name
+    flag_keys = [flag.key for flag in environment.flags]
+        
+    environment.name=request.name
+    environment.description=request.description
+    environment.is_active=request.is_active
+    
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="An environment with this name already exists.") from None
+    db.refresh(environment)
+
+    for flag_key in flag_keys:
+        invalidate_flag_cache_safely(old_environment_name, flag_key)
+    
+    return environment
+
+
+@router.delete("/environment/{environment_id}")
+def delete_environment(
+    environment_id: int,
+    db:Session = Depends(get_db)
+):
+    environment = (
+        db.query(Environment)
+        .filter(Environment.id == environment_id)
+        .first()
+    )
+    
+    if environment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Environment not found.")
+
+    if environment.flags:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Environment cannot be deleted while it contains feature flags.")
+
+    from app.models.audit_log import AuditLog
+    if db.query(AuditLog).filter(AuditLog.environment_id == environment_id).first() is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Environment cannot be deleted because audit history references it.")
+        
+    db.delete(environment)
+    db.commit()
+        
+    return {
+        "message": "Environment is deleted successfully."
+    }
+    
+    

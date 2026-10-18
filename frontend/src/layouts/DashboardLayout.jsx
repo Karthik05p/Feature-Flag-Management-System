@@ -1,0 +1,47 @@
+import { useState } from "react";
+import { Outlet, useLocation } from "react-router-dom";
+import Sidebar from "../components/Sidebar";
+import useAuth from "../hooks/useAuth";
+
+const pageTitles = {
+  "/dashboard": "Overview",
+  "/features": "Feature Flags",
+  "/environments": "Environments",
+  "/rollouts": "Targeting Rules",
+  "/analytics": "Analytics",
+  "/audit-logs": "Audit Logs",
+  "/settings": "Settings",
+  "/sdk-docs": "SDK Docs",
+};
+
+function DashboardLayout({ onSignOut }) {
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const location = useLocation();
+  const pageTitle = pageTitles[location.pathname] || "Workspace";
+  const { username } = useAuth();
+
+  return (
+    <div className="dashboard-layout">
+      <div className={`dashboard-scrim${isSidebarOpen ? " is-visible" : ""}`} onClick={() => setIsSidebarOpen(false)} />
+      <Sidebar isOpen={isSidebarOpen} onClose={() => setIsSidebarOpen(false)} onSignOut={onSignOut} />
+      <main className="dashboard-content">
+        <header className="dashboard-topbar">
+          <button className="dashboard-menu-button" aria-label="Open navigation menu" onClick={() => setIsSidebarOpen(true)} type="button">☰</button>
+          <div className="dashboard-heading">
+            <p className="dashboard-breadcrumb">Workspace / <span>{pageTitle}</span></p>
+            <h1>{pageTitle}</h1>
+          </div>
+          <div className="dashboard-account">
+            <div className="account-avatar" aria-hidden="true">A</div>
+            <div className="account-copy"><strong title={username}>{username}</strong><span>Administrator</span></div>
+          </div>
+        </header>
+        <div className="dashboard-page-content">
+          <Outlet />
+        </div>
+      </main>
+    </div>
+  );
+}
+
+export default DashboardLayout;
